@@ -27,6 +27,14 @@ export class NodeFS extends EmscriptenBuiltinFilesystem {
     // Acquire exclusive lock before mounting the filesystem
     this.#acquireLock()
 
+    // Detect and recover from partially-initialized data directories.
+    // If initdb was interrupted by kill -9, the data directory may contain
+    // partial files that PostgreSQL cannot recover from. We detect this by
+    // checking for PG_VERSION (one of the last files initdb creates).
+    // If the directory has files but no PG_VERSION, wipe and let initdb
+    // start fresh.
+    this.#cleanPartialInit()
+
     const options: Partial<PostgresMod> = {
       ...opts,
       preRun: [
@@ -92,6 +100,59 @@ export class NodeFS extends EmscriptenBuiltinFilesystem {
       } catch {
         // Ignore errors on unlink (dir may already be cleaned up)
       }
+    }
+  }
+
+  #cleanPartialInit() {
+    // Detect partially-initialized data directories from interrupted initdb.
+    //
+    // PostgreSQL's initdb creates files in stages:
+    //   1. PG_VERSION + directory structure + postgresql.conf (~100ms)
+    //   2. global/pg_control during bootstrap (~150ms)
+    //   3. template1 database in base/1/ (ongoing during bootstrap)
+    //   4. template0 database in base/4/ (copy of template1)
+    //   5. postgres database in base/5/
+    //
+    // If killed during any stage, the database may have PG_VERSION and even
+    // pg_control but be missing system views (pg_tables etc.) or entire
+    // databases. A fully initialized PGlite always has 3+ databases in base/.
+    // We detect partial init by checking for fewer than 3 base/ subdirectories.
+    try {
+      const entries = fs.readdirSync(this.rootDir)
+      if (entries.length === 0) return
+
+      const pgVersionPath = path.join(this.rootDir, 'PG_VERSION')
+      if (!fs.existsSync(pgVersionPath)) {
+        // Very early interruption — no PG_VERSION means initdb barely started
+        this.#wipeDataDir(entries)
+        return
+      }
+
+      // PG_VERSION exists — check if initdb completed by counting databases.
+      // A complete initdb creates template1 (base/1), template0 (base/4),
+      // and the user database (base/5). Fewer than 3 means partial init.
+      const basePath = path.join(this.rootDir, 'base')
+      if (fs.existsSync(basePath)) {
+        const databases = fs.readdirSync(basePath)
+        if (databases.length < 3) {
+          this.#wipeDataDir(entries)
+          return
+        }
+      } else {
+        // base/ doesn't exist at all — very incomplete
+        this.#wipeDataDir(entries)
+      }
+    } catch {
+      // If we can't read the directory, let PostgreSQL handle the error
+    }
+  }
+
+  #wipeDataDir(entries: string[]) {
+    for (const entry of entries) {
+      fs.rmSync(path.join(this.rootDir, entry), {
+        recursive: true,
+        force: true,
+      })
     }
   }
 
