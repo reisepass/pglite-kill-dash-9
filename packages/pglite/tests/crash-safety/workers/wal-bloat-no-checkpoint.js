@@ -37,36 +37,35 @@ async function run() {
   await db.waitReady
   process.send('ready')
 
-  // Create schema on first ever cycle
-  if (startCycle === 0) {
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS wal_stress (
-        id SERIAL PRIMARY KEY,
-        cycle INTEGER NOT NULL,
-        batch INTEGER NOT NULL,
-        kind TEXT NOT NULL,
-        value TEXT NOT NULL,
-        counter INTEGER DEFAULT 0,
-        updated_at TIMESTAMP DEFAULT NOW()
-      )
-    `)
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_wal_stress_cycle ON wal_stress (cycle)
-    `)
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_wal_stress_kind ON wal_stress (kind)
-    `)
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS wal_stress_log (
-        id SERIAL PRIMARY KEY,
-        cycle INTEGER NOT NULL,
-        operation TEXT NOT NULL,
-        row_count INTEGER,
-        logged_at TIMESTAMP DEFAULT NOW()
-      )
-    `)
-    process.send('schema-created')
-  }
+  // Always create schema idempotently — previous cycles may have been killed
+  // before schema creation completed, so we must ensure tables exist.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS wal_stress (
+      id SERIAL PRIMARY KEY,
+      cycle INTEGER NOT NULL,
+      batch INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      value TEXT NOT NULL,
+      counter INTEGER DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `)
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_wal_stress_cycle ON wal_stress (cycle)
+  `)
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_wal_stress_kind ON wal_stress (kind)
+  `)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS wal_stress_log (
+      id SERIAL PRIMARY KEY,
+      cycle INTEGER NOT NULL,
+      operation TEXT NOT NULL,
+      row_count INTEGER,
+      logged_at TIMESTAMP DEFAULT NOW()
+    )
+  `)
+  process.send('schema-created')
 
   // Run inner cycles of heavy mixed DML
   for (let c = 0; c < innerCycles; c++) {

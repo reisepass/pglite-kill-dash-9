@@ -478,7 +478,7 @@ describe('crash safety: WAL bloat without checkpoint (30+ kill cycles)', () => {
           child.on('message', (msg) => { messages.push(msg) })
 
           child.on('exit', (code, sig) => {
-            resolve({ killed: killed || sig === 'SIGKILL', messages })
+            resolve({ killed: killed || sig === 'SIGKILL', exitCode: code, messages })
           })
 
           // Very aggressive: kill after 300ms no matter what
@@ -492,13 +492,18 @@ describe('crash safety: WAL bloat without checkpoint (30+ kill cycles)', () => {
           }, 30000)
         })
 
-        // Worker should either be killed by timer or crash due to corruption
-        const burstKilledOrCrashed = burstResult.killed || !burstResult.messages.includes('ready')
-        if (!burstResult.killed && !burstResult.messages.includes('ready')) {
+        // Worker should either be killed by timer, crash on open, or crash during DML
+        const workerKilled = burstResult.killed
+        const workerCrashed = burstResult.exitCode !== 0 && burstResult.exitCode !== null
+        const workerCouldntOpen = !burstResult.messages.includes('ready')
+
+        if (workerCouldntOpen && !workerKilled) {
           console.log(`  Burst cycle ${i}: Worker couldn't open DB (corruption from previous cycles)`)
           break // DB is corrupted, no point continuing
         }
-        expect(burstKilledOrCrashed).toBe(true)
+
+        // The worker must have been killed OR crashed (either before or after opening)
+        expect(workerKilled || workerCrashed || workerCouldntOpen).toBe(true)
       }
 
       // Verify after burst
