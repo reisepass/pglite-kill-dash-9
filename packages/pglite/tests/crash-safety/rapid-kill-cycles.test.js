@@ -333,11 +333,9 @@ describe('crash safety: rapid kill cycles', () => {
 
         await db.close()
       } catch (err) {
-        // Known PGlite limitation: killing during WAL recovery can corrupt
-        // the database beyond recovery. This is a genuine WAL recovery bug,
-        // not related to file locking.
-        console.log(`RECOVERY-KILL CORRUPTION (known issue): ${err.message}`)
+        console.log(`RECOVERY-KILL CORRUPTION: ${err.message}`)
         if (db) try { await db.close() } catch (_) {}
+        expect.fail(`Recovery-kill corrupted DB: ${err.message}`)
       }
     },
     { timeout: 240000 },
