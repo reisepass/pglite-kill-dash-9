@@ -3,14 +3,14 @@
  *
  * Simulates what happens during HMR in dev servers like Vite/Next.js:
  *   1. Opens PGlite instance A on the data dir, does operations
- *   2. WITHOUT closing instance A, opens PGlite instance B on the SAME data dir
- *   3. Instance B does operations while instance A's WASM state is still in memory
- *   4. The process is killed externally, so neither instance gets close() called
+ *   2. WITHOUT closing instance A, attempts to open PGlite instance B
+ *      on the SAME data dir — this should now FAIL due to file locking
+ *   3. If the lock prevents instance B, that's the correct behavior
+ *   4. The process is killed externally (simulating dev server restart)
  *
- * This is the exact pattern that causes corruption in real-world dev usage:
- * when a module is hot-reloaded, the old module's PGlite instance is garbage
- * collected without close() ever being called, while the new module creates
- * a fresh PGlite instance on the same data directory.
+ * With the file lock implementation, instance B should fail to open,
+ * preventing the corruption that previously occurred from overlapping
+ * instances with stale WASM heaps.
  *
  * Environment variables:
  *   PGLITE_DATA_DIR - path to the data directory
@@ -52,7 +52,7 @@ async function run() {
     process.send('schema-created')
   }
 
-  // Instance A does some writes (simulating the "old module" mid-operation)
+  // Instance A does writes
   const padding = 'A'.repeat(500)
   for (let i = 0; i < 10; i++) {
     await instanceA.query(
@@ -63,91 +63,44 @@ async function run() {
   }
   process.send('instance-a-wrote')
 
-  // ---- Phase 2: Open instance B (the "new module" after HMR) ----
-  // CRITICAL: Instance A is NOT closed. This is the HMR bug.
-  // In a real dev server, the old module is simply dereferenced and left
-  // for garbage collection. The PGlite instance and its WASM heap stay
-  // alive until the GC runs, which may be never during the process lifetime.
+  // ---- Phase 2: Attempt to open instance B (the "new module" after HMR) ----
+  // With file locking, this should FAIL — which is the correct behavior.
+  // In a real dev server, the lock prevents corruption from overlapping instances.
+  let instanceBOpened = false
+  try {
+    const instanceB = new PGlite(dataDir)
+    await instanceB.waitReady
+    instanceBOpened = true
+    process.send('instance-b-ready')
 
-  const instanceB = new PGlite(dataDir)
-  await instanceB.waitReady
-  process.send('instance-b-ready')
+    // If we somehow got here (no lock), do overlap operations
+    for (let i = 0; i < overlapOps; i++) {
+      await instanceB.query(
+        `INSERT INTO hmr_data (cycle, instance, phase, seq, payload)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [cycle, 'B', 'post-hmr', i, `cycle${cycle}-B-post-${i}-${padding}`]
+      )
+    }
+    process.send('overlap-done')
+  } catch (err) {
+    // Lock prevented instance B — this is the EXPECTED behavior
+    process.send('instance-b-blocked')
+    process.send(`lock-error:${err.message}`)
+  }
 
-  // ---- Phase 3: Both instances exist simultaneously ----
-  // Instance B does operations while instance A's WASM state is still in memory.
-  // This is the danger zone: two separate WASM heaps, two sets of shared buffers,
-  // both pointing at the same filesystem data directory.
-
-  for (let i = 0; i < overlapOps; i++) {
-    // Instance B writes
-    await instanceB.query(
+  // Instance A continues writing (it holds the lock)
+  for (let i = 10; i < 20; i++) {
+    await instanceA.query(
       `INSERT INTO hmr_data (cycle, instance, phase, seq, payload)
        VALUES ($1, $2, $3, $4, $5)`,
-      [cycle, 'B', 'post-hmr', i, `cycle${cycle}-B-post-${i}-${padding}`]
+      [cycle, 'A', 'post-hmr', i, `cycle${cycle}-A-post-${i}-${padding}`]
     )
-
-    // Occasionally also do reads on instance B to exercise the buffer cache
-    if (i % 5 === 0) {
-      await instanceB.query(`SELECT count(*) FROM hmr_data`)
-      await instanceB.query(`SELECT * FROM hmr_data ORDER BY id DESC LIMIT 5`)
-    }
-
-    // Every few iterations, do an UPDATE on B (which dirties pages that A
-    // might also have cached in its WASM heap)
-    if (i % 7 === 0) {
-      await instanceB.query(
-        `UPDATE hmr_data SET payload = payload || $1
-         WHERE instance = 'B' AND cycle = $2 AND seq = $3`,
-        ['-updated', cycle, i]
-      )
-    }
   }
+  process.send('instance-a-continued')
 
-  process.send('overlap-done')
-
-  // ---- Phase 4: Instance A does MORE writes (stale WASM heap) ----
-  // This is especially dangerous: instance A's buffer cache is stale
-  // (instance B has been writing to the same files on disk), but instance A
-  // doesn't know that. Its WASM heap still has the old page images.
-  try {
-    for (let i = 10; i < 20; i++) {
-      await instanceA.query(
-        `INSERT INTO hmr_data (cycle, instance, phase, seq, payload)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [cycle, 'A', 'post-hmr-stale', i, `cycle${cycle}-A-stale-${i}-${padding}`]
-      )
-    }
-    process.send('instance-a-stale-writes-done')
-  } catch (err) {
-    // Instance A writing after B has modified the same files may error
-    process.send(`instance-a-stale-error:${err.message}`)
-  }
-
-  // ---- Phase 5: Instance B does a DELETE + re-INSERT (more page churn) ----
-  try {
-    await instanceB.query(
-      `DELETE FROM hmr_data WHERE instance = 'A' AND cycle = $1 AND seq < 5`,
-      [cycle]
-    )
-    for (let i = 0; i < 5; i++) {
-      await instanceB.query(
-        `INSERT INTO hmr_data (cycle, instance, phase, seq, payload)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [cycle, 'B', 'replace', i, `cycle${cycle}-B-replace-${i}-${padding}`]
-      )
-    }
-    process.send('instance-b-replace-done')
-  } catch (err) {
-    process.send(`instance-b-replace-error:${err.message}`)
-  }
-
-  // Signal that the overlap phase is fully done; the parent will SIGKILL us
-  // WITHOUT either instance being closed. This simulates the dev killing
-  // their dev server with Ctrl+C or the process being killed by the OS.
   process.send('all-operations-done')
 
   // Keep the process alive so the parent can kill it
-  // (neither instance A nor B is closed)
   await new Promise(() => {})
 }
 

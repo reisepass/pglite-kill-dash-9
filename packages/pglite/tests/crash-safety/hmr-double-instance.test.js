@@ -1,26 +1,17 @@
 /**
  * Crash Safety Test: HMR (Hot Module Reload) Double Instance
  *
- * This is the most realistic simulation of how PGlite gets corrupted in
- * daily dev usage. When a dev server like Vite or Next.js performs HMR:
+ * Tests the file lock mechanism that prevents overlapping PGlite instances
+ * from corrupting the database during HMR in dev servers like Vite/Next.js.
  *
- *   1. The old module is dereferenced (but NOT cleaned up)
- *   2. The new module is loaded and creates a new PGlite instance
- *   3. The old PGlite instance's WASM heap is still in memory
- *   4. Both instances share the same filesystem data directory
- *   5. The old instance never gets close() called (no checkpoint)
- *   6. Eventually the dev kills the process (Ctrl+C, process exit)
+ * With the lock file implementation:
+ *   1. Instance A opens and acquires the lock
+ *   2. Instance B attempts to open the SAME data dir and is BLOCKED by the lock
+ *   3. Only instance A writes data
+ *   4. When killed with SIGKILL, the stale lock is detected on next open
  *
- * This test runs multiple cycles of this pattern, each time:
- *   - Opening instance A, doing writes
- *   - Opening instance B on the SAME dir WITHOUT closing A
- *   - Both instances do overlapping writes
- *   - SIGKILL the process (no close() on either)
- *   - Reopen and verify integrity
- *
- * The key corruption vector: instance A's WASM heap holds dirty buffer pages
- * that don't match what's on disk (since instance B has been writing), and
- * neither instance gets a clean shutdown checkpoint.
+ * This prevents the corruption that previously occurred when two WASM heaps
+ * both accessed the same PostgreSQL data directory simultaneously.
  */
 
 import { describe, it, expect, afterAll } from 'vitest'
@@ -33,6 +24,11 @@ afterAll(async () => {
   if (!process.env.RETAIN_DATA) {
     if (existsSync(dataDir)) {
       rmSync(dataDir, { recursive: true, force: true })
+    }
+    // Clean up sibling lock files
+    const lockFile = dataDir + '.lock'
+    if (existsSync(lockFile)) {
+      rmSync(lockFile, { force: true })
     }
   }
 })
@@ -51,7 +47,6 @@ describe('crash safety: HMR double-instance corruption', () => {
       const cycleResults = []
 
       for (let cycle = 0; cycle < NUM_CYCLES; cycle++) {
-        // Vary the overlap intensity per cycle to hit different timing windows
         const overlapOps = cycle < 2 ? 10 : (cycle < 5 ? 25 : 40)
 
         const result = await new Promise((resolve) => {
@@ -75,26 +70,10 @@ describe('crash safety: HMR double-instance corruption', () => {
           child.on('message', (msg) => {
             messages.push(msg)
 
-            // Kill when the overlap phase is fully done (both instances
-            // have been writing, maximum dirty state) OR when we've seen
-            // enough operations. For early cycles, kill mid-overlap for
-            // extra aggression.
-            if (cycle < 3) {
-              // Kill mid-overlap for cycles 0-2 (most aggressive)
-              if (msg === 'overlap-done') {
-                if (!killed) {
-                  killed = true
-                  child.kill('SIGKILL')
-                }
-              }
-            } else {
-              // Kill after all operations for later cycles
-              if (msg === 'all-operations-done') {
-                if (!killed) {
-                  killed = true
-                  child.kill('SIGKILL')
-                }
-              }
+            // Kill after all operations are done (instance A has written data)
+            if (msg === 'all-operations-done' && !killed) {
+              killed = true
+              child.kill('SIGKILL')
             }
           })
 
@@ -109,31 +88,27 @@ describe('crash safety: HMR double-instance corruption', () => {
             })
           })
 
-          // Fallback timer: if the worker takes too long (e.g., it hangs
-          // because the second instance can't open), kill after 15s
+          // Fallback timer: kill after 15s if worker hasn't finished
           setTimeout(() => {
             if (!killed) {
               killed = true
               child.kill('SIGKILL')
             }
           }, 15000)
-
-          // Safety timeout
-          setTimeout(() => {
-            if (!killed) {
-              killed = true
-              child.kill('SIGKILL')
-            }
-          }, 30000)
         })
 
         cycleResults.push(result)
 
-        // Verify the worker was killed (not exited cleanly)
+        // The worker should either be killed by us or exit cleanly
+        // (it's killed after 'all-operations-done')
         expect(result.killed).toBe(true)
 
         // Instance A should have been ready in every cycle
         expect(result.messages).toContain('instance-a-ready')
+
+        // Instance B should have been BLOCKED by the lock
+        expect(result.messages).toContain('instance-b-blocked')
+        expect(result.messages).not.toContain('instance-b-ready')
 
         // On the first cycle, schema should have been created
         if (cycle === 0) {
@@ -147,8 +122,6 @@ describe('crash safety: HMR double-instance corruption', () => {
         )
 
         // ---- Intermediate recovery check every 2 cycles ----
-        // Try to open the DB after the crash and verify it's still usable.
-        // This catches progressive corruption that builds up over cycles.
         if (cycle % 2 === 1 || cycle === NUM_CYCLES - 1) {
           let db = null
           let openSuccess = false
@@ -181,13 +154,21 @@ describe('crash safety: HMR double-instance corruption', () => {
               `)
               expect(tableCheck.rows.length).toBe(1)
 
-              // Count rows - should have some data
+              // Count rows - with the lock, only instance A writes
               const countResult = await db.query(
                 'SELECT count(*)::int as cnt FROM hmr_data'
               )
               const rowCount = countResult.rows[0].cnt
               console.log(`After cycle ${cycle}: ${rowCount} rows in hmr_data`)
               expect(rowCount).toBeGreaterThan(0)
+
+              // All rows should be from instance A (B was blocked)
+              const instanceCheck = await db.query(
+                `SELECT DISTINCT instance FROM hmr_data`
+              )
+              const instances = instanceCheck.rows.map(r => r.instance)
+              expect(instances).toContain('A')
+              expect(instances).not.toContain('B')
 
               // Verify index is usable
               const indexScan = await db.query(
@@ -202,12 +183,12 @@ describe('crash safety: HMR double-instance corruption', () => {
               )
               expect(allRows.rows.length).toBe(rowCount)
 
-              // Check for data consistency: each row should have valid fields
+              // Check for data consistency
               for (const row of allRows.rows) {
                 expect(row.id).toBeGreaterThan(0)
                 expect(row.cycle).toBeGreaterThanOrEqual(0)
                 expect(row.cycle).toBeLessThanOrEqual(cycle)
-                expect(['A', 'B']).toContain(row.instance)
+                expect(row.instance).toBe('A')
                 expect(typeof row.phase).toBe('string')
                 expect(row.seq).toBeGreaterThanOrEqual(0)
               }
@@ -216,11 +197,11 @@ describe('crash safety: HMR double-instance corruption', () => {
             }
           }
 
-          // The DB MUST be openable - if not, we found the corruption bug
+          // The DB MUST be openable
           expect(openSuccess).toBe(true)
         }
 
-        // Small delay between cycles to let filesystem settle
+        // Small delay between cycles
         await new Promise((r) => setTimeout(r, 200))
       }
 
@@ -254,9 +235,7 @@ describe('crash safety: HMR double-instance corruption', () => {
           WHERE schemaname = 'public'
         `)
         for (const idx of indexes.rows) {
-          await finalDb.query(
-            `SELECT count(*) FROM "${idx.tablename}"`
-          )
+          await finalDb.query(`SELECT count(*) FROM "${idx.tablename}"`)
         }
 
         // Row count audit
@@ -265,7 +244,7 @@ describe('crash safety: HMR double-instance corruption', () => {
         )
         console.log(`Final row count: ${finalCount.rows[0].cnt}`)
 
-        // Per-cycle breakdown
+        // Per-cycle breakdown (all should be instance A only)
         const cycleBreakdown = await finalDb.query(`
           SELECT cycle, instance, count(*)::int as cnt
           FROM hmr_data
@@ -275,6 +254,8 @@ describe('crash safety: HMR double-instance corruption', () => {
         console.log('Per-cycle breakdown:')
         for (const row of cycleBreakdown.rows) {
           console.log(`  cycle=${row.cycle} instance=${row.instance} count=${row.cnt}`)
+          // With the lock, all rows should be from instance A
+          expect(row.instance).toBe('A')
         }
 
         // Verify we can still write to the database
@@ -302,8 +283,6 @@ describe('crash safety: HMR double-instance corruption', () => {
       // Use a separate data dir for this sub-test
       const rapidDataDir = `${dataDir}-rapid`
 
-      // This test is more extreme: we open instance B almost immediately
-      // after instance A starts, giving maximum overlap time.
       const workerPath = new URL(
         './workers/hmr-double-instance.js',
         import.meta.url,
@@ -321,7 +300,6 @@ describe('crash safety: HMR double-instance corruption', () => {
               ...process.env,
               PGLITE_DATA_DIR: rapidDataDir,
               CYCLE: String(cycle),
-              // Very high overlap to maximize concurrent dirty pages
               OVERLAP_OPS: '50',
             },
             stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
@@ -334,10 +312,9 @@ describe('crash safety: HMR double-instance corruption', () => {
           child.on('message', (msg) => {
             messages.push(msg)
 
-            // Kill as soon as instance B is ready (maximum overlap,
-            // neither instance has done much work after B opened)
-            if (msg === 'instance-b-ready' && !killed) {
-              // Give a tiny window for B to start writing, then kill
+            // Kill after instance B is blocked (or after instance A continues)
+            if ((msg === 'instance-b-blocked' || msg === 'instance-a-continued') && !killed) {
+              // Give a tiny window then kill
               setTimeout(() => {
                 if (!killed) {
                   killed = true
@@ -356,7 +333,8 @@ describe('crash safety: HMR double-instance corruption', () => {
           }, 15000)
         })
 
-        expect(result.killed).toBe(true)
+        // Worker should be either killed by us or crashed due to lock error
+        expect(result.killed || result.exitCode !== 0).toBe(true)
       }
 
       // Verify the DB is still usable after rapid HMR cycles
@@ -380,6 +358,16 @@ describe('crash safety: HMR double-instance corruption', () => {
           const count = await db.query('SELECT count(*)::int as cnt FROM hmr_data')
           console.log(`Rapid HMR test: ${count.rows[0].cnt} rows survived`)
           expect(count.rows[0].cnt).toBeGreaterThanOrEqual(0)
+
+          // All surviving rows should be from instance A
+          const instanceCheck = await db.query(
+            `SELECT DISTINCT instance FROM hmr_data`
+          )
+          if (instanceCheck.rows.length > 0) {
+            for (const row of instanceCheck.rows) {
+              expect(row.instance).toBe('A')
+            }
+          }
         }
 
         await db.close()
@@ -388,8 +376,14 @@ describe('crash safety: HMR double-instance corruption', () => {
         if (db) try { await db.close() } catch (_) {}
         expect.fail(`Rapid HMR corrupted DB: ${err.message}`)
       } finally {
-        if (!process.env.RETAIN_DATA && existsSync(rapidDataDir)) {
-          rmSync(rapidDataDir, { recursive: true, force: true })
+        if (!process.env.RETAIN_DATA) {
+          if (existsSync(rapidDataDir)) {
+            rmSync(rapidDataDir, { recursive: true, force: true })
+          }
+          const lockFile = rapidDataDir + '.lock'
+          if (existsSync(lockFile)) {
+            rmSync(lockFile, { force: true })
+          }
         }
       }
     },

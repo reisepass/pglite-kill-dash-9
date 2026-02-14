@@ -228,11 +228,16 @@ export async function verifyIntegrity(db) {
 }
 
 /**
- * Clean up a test data directory.
+ * Clean up a test data directory and its sibling lock file.
  */
 export function cleanupDataDir(dataDir) {
   if (existsSync(dataDir)) {
     rmSync(dataDir, { recursive: true, force: true })
+  }
+  // Also clean up the sibling lock file (dataDir.lock)
+  const lockFile = dataDir + '.lock'
+  if (existsSync(lockFile)) {
+    rmSync(lockFile, { force: true })
   }
 }
 
